@@ -1,118 +1,137 @@
 // ──────────────────────────────────────────────
 // server.js  –  Expense Tracker API
-//               with SQLite + Auth (bcrypt + JWT)
-// Run with: node server.js
+//               PostgreSQL edition (Render-ready)
+//
+// WHY NOT SQLITE ON RENDER?
+// Render's file system is ephemeral — it resets on every deploy and
+// restart. Any SQLite .db file written to disk will be silently wiped.
+// PostgreSQL (free on Render) is the correct solution for persistence.
+//
+// SETUP:
+//   1. Create a free PostgreSQL database on Render dashboard
+//   2. Copy the "Internal Database URL" into your Web Service's
+//      environment variables as:  DATABASE_URL=postgres://...
+//   3. npm install express cors bcrypt jsonwebtoken pg
+//   4. Deploy — Render injects DATABASE_URL automatically at runtime
 // ──────────────────────────────────────────────
 
 const express = require("express");
 const cors    = require("cors");
-const sqlite3 = require("sqlite3").verbose();
 const bcrypt  = require("bcrypt");
 const jwt     = require("jsonwebtoken");
-const path    = require("path");
+const { Pool } = require("pg");       // 'pg' is the PostgreSQL client
 
 const app  = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;  // Render sets PORT automatically
 
 // ── Environment config ─────────────────────────
-const JWT_SECRET     = process.env.JWT_SECRET || "change-this-secret-in-production";
+const JWT_SECRET     = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = "7d";
 const BCRYPT_ROUNDS  = 12;
 
-if (!process.env.JWT_SECRET) {
-  console.warn("⚠️   JWT_SECRET not set — using insecure default. Set it before deploying.");
+// Hard-fail on startup if critical env vars are missing.
+// It is much better to crash immediately with a clear message than to
+// start up and then fail mysteriously on the first authenticated request.
+if (!JWT_SECRET) {
+  console.error("❌  FATAL: JWT_SECRET environment variable is not set.");
+  console.error("    Add it to your Render Web Service → Environment tab.");
+  process.exit(1);
 }
 
-// ── Database setup ─────────────────────────────
-const DB_PATH = path.join(__dirname, "expenses.db");
+if (!process.env.DATABASE_URL) {
+  console.error("❌  FATAL: DATABASE_URL environment variable is not set.");
+  console.error("    Create a PostgreSQL database on Render and link it to this service.");
+  process.exit(1);
+}
 
-const db = new sqlite3.Database(DB_PATH, (err) => {
-  if (err) {
-    console.error("❌  Could not connect to database:", err.message);
-    process.exit(1);
-  }
-  console.log(`📦  Connected to SQLite at ${DB_PATH}`);
+// ── PostgreSQL connection pool ─────────────────
+// A pool manages multiple connections efficiently.
+// `ssl: { rejectUnauthorized: false }` is required for Render's hosted
+// PostgreSQL — their certs are valid but self-signed for internal URLs.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : false,
+  max:              10,   // max simultaneous connections in the pool
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
-// FIX 1: Foreign key enforcement + table creation are all inside one
-// db.serialize() block. serialize() guarantees that every statement runs
-// to completion before the next one starts, so the PRAGMA is always
-// active before any INSERT can be attempted — even on the very first
-// request after startup. Previously the PRAGMA may have run async and
-// lost the race against incoming requests.
-db.serialize(() => {
+// ── DB helpers ─────────────────────────────────
+// Thin wrappers so route handlers look the same as the SQLite version.
 
-  // FIX 1a: PRAGMA must be the FIRST statement in the serialize block.
-  // SQLite foreign key enforcement is per-connection and off by default;
-  // it must be switched on before any table that uses REFERENCES is touched.
-  db.run("PRAGMA foreign_keys = ON", (err) => {
-    if (err) console.error("❌  Failed to enable foreign keys:", err.message);
-    else     console.log("🔗  Foreign key enforcement: ON");
-  });
+async function dbRun(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result;
+}
 
+async function dbAll(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows;
+}
+
+async function dbGet(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows[0];   // undefined if no rows
+}
+
+// ── Table initialisation ───────────────────────
+// Creates tables if they don't already exist.
+// Called once after the pool is confirmed healthy (see initDatabase below).
+async function createTables() {
   // Users table
-  db.run(
-    `CREATE TABLE IF NOT EXISTS users (
-      id            INTEGER  PRIMARY KEY AUTOINCREMENT,
-      username      TEXT     NOT NULL UNIQUE,
-      password_hash TEXT     NOT NULL,
-      created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    (err) => {
-      if (err) console.error("❌  Failed to create users table:", err.message);
-      else     console.log("✅  Users table ready");
-    }
-  );
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            SERIAL       PRIMARY KEY,
+      username      TEXT         NOT NULL UNIQUE,
+      password_hash TEXT         NOT NULL,
+      created_at    TIMESTAMPTZ  DEFAULT NOW()
+    )
+  `);
+  console.log("✅  Users table ready");
 
-  // Expenses table — user_id is a FOREIGN KEY back to users.id
-  db.run(
-    `CREATE TABLE IF NOT EXISTS expenses (
-      id         INTEGER  PRIMARY KEY AUTOINCREMENT,
-      user_id    INTEGER  NOT NULL,
-      name       TEXT     NOT NULL,
-      amount     REAL     NOT NULL,
-      category   TEXT     NOT NULL,
-      emoji      TEXT     NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-    )`,
-    (err) => {
-      if (err) console.error("❌  Failed to create expenses table:", err.message);
-      else     console.log("✅  Expenses table ready");
-    }
-  );
-});
-
-// ── DB promise helpers ─────────────────────────
-// sqlite3 is callback-based; these wrappers let us use async/await.
-// IMPORTANT: db.run() callbacks must use `function`, not arrow functions —
-// only `function` binds `this`, which is where sqlite3 puts lastID/changes.
-
-function dbRun(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else     resolve(this);   // this.lastID, this.changes
-    });
-  });
+  // Expenses table with foreign key to users
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id         SERIAL       PRIMARY KEY,
+      user_id    INTEGER      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+      name       TEXT         NOT NULL,
+      amount     NUMERIC      NOT NULL,
+      category   TEXT         NOT NULL,
+      emoji      TEXT         NOT NULL,
+      created_at TIMESTAMPTZ  DEFAULT NOW()
+    )
+  `);
+  console.log("✅  Expenses table ready");
 }
 
-function dbAll(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else     resolve(rows);
-    });
-  });
-}
+// ── Database initialisation with retry ────────
+// Render's PostgreSQL sometimes takes a few seconds to accept connections
+// immediately after a deploy. We retry up to 5 times with a 2-second gap
+// rather than crashing on the first transient failure.
+async function initDatabase(retriesLeft = 5, delayMs = 2000) {
+  try {
+    // Test the connection before trying to create tables
+    const client = await pool.connect();
+    console.log("📦  Connected to PostgreSQL");
+    client.release();
 
-function dbGet(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else     resolve(row);    // undefined when no row matches
-    });
-  });
+    await createTables();
+    console.log("🚀  Database initialised successfully");
+  } catch (err) {
+    if (retriesLeft === 0) {
+      console.error("❌  FATAL: Could not initialise database after multiple retries.");
+      console.error("    Last error:", err.message);
+      // Don't call process.exit here — let the server keep running so
+      // Render's health check can hit GET / and you can read the error
+      // in the logs rather than getting a cryptic "Exited with status 1".
+      return;
+    }
+    console.warn(`⚠️   DB init failed (${err.message}). Retrying in ${delayMs / 1000}s… (${retriesLeft} attempts left)`);
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return initDatabase(retriesLeft - 1, delayMs);
+  }
 }
 
 // ── Middleware ─────────────────────────────────
@@ -121,15 +140,22 @@ app.use(express.json());
 
 // Request logger
 app.use((req, _res, next) => {
-  console.log(`[${new Date().toLocaleTimeString()}]  ${req.method}  ${req.path}`);
+  console.log(`[${new Date().toISOString()}]  ${req.method}  ${req.path}`);
   next();
 });
 
+// Health check — Render pings this to confirm the service is alive.
+// Responds even if the DB isn't ready yet so the deploy doesn't time out.
+app.get("/", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", database: "connected" });
+  } catch {
+    res.status(503).json({ status: "ok", database: "unavailable" });
+  }
+});
+
 // ── Auth middleware ────────────────────────────
-// FIX 2: The middleware now explicitly logs what it finds in the token
-// so you can see at a glance whether id/username are present and correct.
-// It also re-reads PRAGMA foreign_keys to confirm the setting survived
-// the connection lifetime (SQLite resets it on reconnect in some drivers).
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
 
@@ -137,22 +163,15 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Missing or malformed Authorization header." });
   }
 
-  const token = authHeader.slice(7);   // strip "Bearer "
+  const token = authHeader.slice(7);
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-
-    // FIX 2a: Log exactly what the token contains so you can confirm the
-    // shape of the payload. If `decoded.id` is undefined here, the token
-    // was signed with a different payload shape (e.g. `userId` vs `id`).
     console.log(`  🔍 Token decoded — id: ${decoded.id}, username: "${decoded.username}"`);
 
-    // FIX 2b: Explicitly confirm the user still exists in the database.
-    // A token can be valid (correct signature, not expired) but reference
-    // a user that was deleted since it was issued. Without this check the
-    // FOREIGN KEY constraint will fire when we try to INSERT the expense.
+    // Verify the user still exists in the database
     const userInDb = await dbGet(
-      "SELECT id, username FROM users WHERE id = ?",
+      "SELECT id, username FROM users WHERE id = $1",
       [decoded.id]
     );
 
@@ -161,12 +180,8 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: "User account not found. Please log in again." });
     }
 
-    // FIX 2c: Attach the database row (not just the token payload) to req.user.
-    // This guarantees req.user.id is the real integer primary key from the
-    // users table — exactly what the expenses.user_id foreign key expects.
-    req.user = userInDb;   // { id: <integer>, username: <string> }
+    req.user = userInDb;
     console.log(`  ✅ Auth OK — user #${req.user.id} ("${req.user.username}")`);
-
     next();
   } catch (err) {
     if (err.name === "TokenExpiredError") {
@@ -184,14 +199,11 @@ const CATEGORY_EMOJI = {
   Entertainment: "🎬",
   Other:         "📦",
 };
-
 const VALID_CATEGORIES = Object.keys(CATEGORY_EMOJI);
 
 function generateToken(user) {
-  // FIX 3: Log the payload being signed so you can verify the shape matches
-  // what requireAuth expects (i.e. `id`, not `userId` or `user_id`).
   const payload = { id: user.id, username: user.username };
-  console.log(`  🪙 Signing token with payload:`, payload);
+  console.log("  🪙 Signing token with payload:", payload);
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
@@ -209,23 +221,21 @@ app.post("/api/auth/register", async (req, res) => {
   const cleanUsername = username.trim().toLowerCase();
 
   try {
-    const existing = await dbGet("SELECT id FROM users WHERE username = ?", [cleanUsername]);
+    const existing = await dbGet(
+      "SELECT id FROM users WHERE username = $1",
+      [cleanUsername]
+    );
     if (existing) return res.status(409).json({ error: "Username already taken." });
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const stmt         = await dbRun(
-      "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+
+    // PostgreSQL uses RETURNING to get the inserted row back in one query
+    const newUser = await dbGet(
+      "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username, created_at",
       [cleanUsername, passwordHash]
     );
 
-    const newUser = await dbGet(
-      "SELECT id, username, created_at FROM users WHERE id = ?",
-      [stmt.lastID]
-    );
-
-    // FIX 3: generateToken now logs the payload — verify `id` is an integer
     const token = generateToken(newUser);
-
     console.log(`  👤 Registered user: "${newUser.username}" (#${newUser.id})`);
     res.status(201).json({ id: newUser.id, username: newUser.username, token });
 
@@ -245,16 +255,17 @@ app.post("/api/auth/login", async (req, res) => {
   const cleanUsername = username.trim().toLowerCase();
 
   try {
-    const user = await dbGet("SELECT * FROM users WHERE username = ?", [cleanUsername]);
+    const user = await dbGet(
+      "SELECT * FROM users WHERE username = $1",
+      [cleanUsername]
+    );
 
-    // Generic message intentionally — avoids revealing which usernames exist
     if (!user) return res.status(401).json({ error: "Invalid username or password." });
 
     const passwordMatch = await bcrypt.compare(password, user.password_hash);
     if (!passwordMatch) return res.status(401).json({ error: "Invalid username or password." });
 
-    const token = generateToken(user);   // logs payload
-
+    const token = generateToken(user);
     console.log(`  🔑 Logged in: "${user.username}" (#${user.id})`);
     res.json({ id: user.id, username: user.username, token });
 
@@ -264,13 +275,13 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// ── Expense routes (all protected) ────────────
+// ── Expense routes ─────────────────────────────
 
 // GET /api/expenses
 app.get("/api/expenses", requireAuth, async (req, res) => {
   try {
     const rows = await dbAll(
-      "SELECT * FROM expenses WHERE user_id = ? ORDER BY amount DESC",
+      "SELECT * FROM expenses WHERE user_id = $1 ORDER BY amount DESC",
       [req.user.id]
     );
     console.log(`  📋 Returning ${rows.length} expenses for user #${req.user.id}`);
@@ -285,71 +296,35 @@ app.get("/api/expenses", requireAuth, async (req, res) => {
 app.post("/api/expenses", requireAuth, async (req, res) => {
   const { name, amount, category } = req.body;
 
-  // Validation
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: "Field 'name' is required." });
-  }
-  if (amount === undefined || amount === null || amount === "") {
-    return res.status(400).json({ error: "Field 'amount' is required." });
-  }
-  if (isNaN(Number(amount)) || Number(amount) <= 0) {
-    return res.status(400).json({ error: "Field 'amount' must be a positive number." });
-  }
-  if (!category || !category.trim()) {
-    return res.status(400).json({ error: "Field 'category' is required." });
-  }
-  if (!VALID_CATEGORIES.includes(category)) {
-    return res.status(400).json({
-      error: `Field 'category' must be one of: ${VALID_CATEGORIES.join(", ")}.`,
-    });
-  }
-
-  // FIX 4: Log the user we're about to create an expense for.
-  // If you see "undefined" here the bug is in requireAuth, not in this handler.
-  console.log(`  ➕ Creating expense for user: ${req.user.id} ("${req.user.username}")`);
-
-  // FIX 5: Re-verify the user exists in the users table right before the
-  // INSERT. requireAuth already did this, but doing it again here gives a
-  // crystal-clear error message if somehow the check was bypassed, and it
-  // rules out any timing issue where the user was deleted between the two
-  // steps (unlikely but worth guarding against in production).
-  const userExists = await dbGet("SELECT id FROM users WHERE id = ?", [req.user.id]);
-  if (!userExists) {
-    console.error(`  ❌ User #${req.user.id} not found in users table at INSERT time`);
-    return res.status(401).json({ error: "User not found. Please log in again." });
-  }
+  if (!name || !name.trim())                          return res.status(400).json({ error: "Field 'name' is required." });
+  if (amount == null || amount === "")                return res.status(400).json({ error: "Field 'amount' is required." });
+  if (isNaN(Number(amount)) || Number(amount) <= 0)  return res.status(400).json({ error: "Field 'amount' must be a positive number." });
+  if (!category || !category.trim())                  return res.status(400).json({ error: "Field 'category' is required." });
+  if (!VALID_CATEGORIES.includes(category))           return res.status(400).json({ error: `Field 'category' must be one of: ${VALID_CATEGORIES.join(", ")}.` });
 
   const cleanName = name.trim();
   const cleanAmt  = Number(amount);
   const emoji     = CATEGORY_EMOJI[category];
 
-  try {
-    // FIX 4b: Log the exact values going into the INSERT so you can
-    // inspect them before the query fires — particularly user_id.
-    console.log(`  💾 INSERT expenses — user_id: ${req.user.id}, name: "${cleanName}", amount: ${cleanAmt}, category: "${category}"`);
+  console.log(`  ➕ Creating expense for user: ${req.user.id} ("${req.user.username}")`);
+  console.log(`  💾 INSERT — user_id: ${req.user.id}, name: "${cleanName}", amount: ${cleanAmt}, category: "${category}"`);
 
-    const stmt = await dbRun(
-      "INSERT INTO expenses (user_id, name, amount, category, emoji) VALUES (?, ?, ?, ?, ?)",
+  try {
+    // RETURNING lets us skip a second SELECT to fetch the new row
+    const newExpense = await dbGet(
+      `INSERT INTO expenses (user_id, name, amount, category, emoji)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
       [req.user.id, cleanName, cleanAmt, category, emoji]
     );
 
-    const newExpense = await dbGet(
-      "SELECT * FROM expenses WHERE id = ?",
-      [stmt.lastID]
-    );
-
-    console.log(`  ✚ Created expense #${newExpense.id} for user #${req.user.id}: "${newExpense.name}" (₹${newExpense.amount})`);
+    console.log(`  ✚ Created expense #${newExpense.id} for user #${req.user.id}`);
     res.status(201).json(newExpense);
 
   } catch (err) {
-    // FIX 6: Catch the FK error specifically and return a meaningful message
-    // instead of a generic 500, so the frontend can surface it clearly.
-    if (err.message.includes("FOREIGN KEY")) {
-      console.error(`  ❌ FOREIGN KEY constraint failed — user_id ${req.user.id} does not exist in users table`);
-      console.error(`     Full error: ${err.message}`);
-      return res.status(400).json({
-        error: `User #${req.user.id} not found in database. Your session may be stale — please log out and log back in.`,
-      });
+    if (err.code === "23503") {   // PostgreSQL foreign key violation code
+      console.error(`  ❌ FK violation — user_id ${req.user.id} not in users table`);
+      return res.status(400).json({ error: "User not found. Please log out and log in again." });
     }
     console.error("❌  POST /api/expenses:", err.message);
     res.status(500).json({ error: "Failed to create expense." });
@@ -359,29 +334,21 @@ app.post("/api/expenses", requireAuth, async (req, res) => {
 // DELETE /api/expenses/:id
 app.delete("/api/expenses/:id", requireAuth, async (req, res) => {
   const id = parseInt(req.params.id, 10);
-
-  if (isNaN(id)) {
-    return res.status(400).json({ error: "Expense ID must be a number." });
-  }
+  if (isNaN(id)) return res.status(400).json({ error: "Expense ID must be a number." });
 
   try {
-    // WHERE user_id = ? ensures users can only delete their own expenses
-    const existing = await dbGet(
-      "SELECT * FROM expenses WHERE id = ? AND user_id = ?",
+    // RETURNING lets us confirm what was deleted without a prior SELECT
+    const deleted = await dbGet(
+      "DELETE FROM expenses WHERE id = $1 AND user_id = $2 RETURNING *",
       [id, req.user.id]
     );
 
-    if (!existing) {
+    if (!deleted) {
       return res.status(404).json({ error: `Expense with id ${id} not found.` });
     }
 
-    await dbRun(
-      "DELETE FROM expenses WHERE id = ? AND user_id = ?",
-      [id, req.user.id]
-    );
-
-    console.log(`  ✖ User #${req.user.id} deleted expense #${id}: "${existing.name}"`);
-    res.json({ success: true, message: "Deleted", deleted: existing });
+    console.log(`  ✖ User #${req.user.id} deleted expense #${id}: "${deleted.name}"`);
+    res.json({ success: true, message: "Deleted", deleted });
 
   } catch (err) {
     console.error(`❌  DELETE /api/expenses/${id}:`, err.message);
@@ -395,30 +362,24 @@ app.use((req, res) => {
 });
 
 // ── Graceful shutdown ──────────────────────────
-function shutdown(signal) {
-  console.log(`\n${signal} received — closing database…`);
-  db.close((err) => {
-    if (err) console.error("Error closing database:", err.message);
-    else     console.log("Database closed. Goodbye! 👋");
-    process.exit(0);
-  });
+async function shutdown(signal) {
+  console.log(`\n${signal} received — closing DB pool…`);
+  await pool.end();
+  console.log("Pool closed. Goodbye! 👋");
+  process.exit(0);
 }
 process.on("SIGINT",  () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// ── Start server ───────────────────────────────
-app.listen(PORT, () => {
+// ── Start: listen first, then init DB ─────────
+// Render's health check expects the server to accept HTTP connections
+// quickly after deploy. We start listening immediately, then connect to
+// the database in the background. The health check endpoint (GET /)
+// reports database status honestly without blocking startup.
+app.listen(PORT, async () => {
   console.log("─────────────────────────────────────────");
-  console.log("  🚀  Expense Tracker API  (Auth + SQLite)");
-  console.log(`  🌐  http://localhost:${PORT}`);
-  console.log("  ─────────────────────────────────────");
-  console.log("  👤  POST   /api/auth/register");
-  console.log("  🔑  POST   /api/auth/login");
-  console.log("  ─────────────────────────────────────");
-  console.log("  📋  GET    /api/expenses      🔒");
-  console.log("  ➕  POST   /api/expenses      🔒");
-  console.log("  🗑   DELETE /api/expenses/:id  🔒");
-  console.log("  ─────────────────────────────────────");
-  console.log("  🔒 = requires Authorization: Bearer <token>");
+  console.log("  🚀  Expense Tracker API  (PostgreSQL)");
+  console.log(`  🌐  Listening on port ${PORT}`);
   console.log("─────────────────────────────────────────");
+  await initDatabase();
 });
